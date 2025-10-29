@@ -1,0 +1,25 @@
+version: '3.8'
+
+# Development override file - DO NOT USE IN PRODUCTION
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  fastapi:
+    # Development: Enable hot reload with volume mounts
+    volumes:
+      - ./src:/app/src
+      - ./alembic:/app/alembic
+    # Development: Override command for reload
+    command: ["uvicorn", "src.backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    # Development: Relax security for easier debugging
+    read_only: false
+    security_opt: []
+    cap_add:
+      - ALL
+    cap_drop: []
+
+  postgres:
+    # Development: Expose database port for direct access
+    ports:
+      - "5432:5432"
+
