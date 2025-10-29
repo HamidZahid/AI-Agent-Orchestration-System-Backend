@@ -98,6 +98,19 @@ class ProcessingService:
                 )
                 self.db.add(agent_result)
 
+            # Diagnostic: number of agent results staged
+            try:
+                logger.info(
+                    "Persistence stage: agent_results staged",
+                    extra={
+                        "request_id": request_id,
+                        "num_agent_results": len(aggregated_data["agent_results"]),
+                    },
+                )
+            except Exception:
+                # best-effort logging only
+                pass
+
             # Check if any agent failed
             has_failures = any(
                 result["status"] == "error"
@@ -124,7 +137,38 @@ class ProcessingService:
             request.status = (
                 RequestStatus.COMPLETED if not has_failures else RequestStatus.FAILED
             )
-            await self.db.commit()
+            
+            # Commit agent results, aggregated result, and status change together
+            try:
+                await self.db.commit()
+                logger.info(
+                    f"Aggregated result saved for request {request_id}",
+                    extra={
+                        "request_id": request_id,
+                        "has_result": True,
+                        "status": request.status.value,
+                    },
+                )
+                # Verify visibility with a fresh scalar query
+                verify = await self.db.scalar(
+                    select(AggregatedResult).where(AggregatedResult.request_id == request_id)
+                )
+                logger.info(
+                    "Persistence verification",
+                    extra={
+                        "request_id": request_id,
+                        "aggregated_result_visible": bool(verify),
+                    },
+                )
+            except Exception as commit_error:
+                await self.db.rollback()
+                logger.error(
+                    f"Failed to commit aggregated result for request {request_id}: {str(commit_error)}",
+                    exc_info=True,
+                    extra={"request_id": request_id},
+                )
+                # Re-raise to let outer exception handler deal with it
+                raise
 
             logger.info(
                 f"Processing completed for request {request_id}",
@@ -135,29 +179,32 @@ class ProcessingService:
                 },
             )
 
-            # Send webhook if configured
+            # Send webhook if configured (use separate session to avoid conflicts)
             if request.webhook_url:
                 logger.info(
                     f"Triggering webhook for request {request_id}",
                     extra={"request_id": request_id},
                 )
 
-                webhook_service = WebhookService(self.db)
-
-                # Prepare result data with timestamp
-                result_data = {
-                    **aggregated_data,
-                    "timestamp": datetime.utcnow(),
-                }
-
-                try:
-                    await webhook_service.send_webhook(request_id, result_data)
-                except Exception as e:
-                    logger.error(
-                        f"Webhook delivery failed for request {request_id}: {str(e)}",
-                        extra={"request_id": request_id},
-                    )
-                    # Don't fail the entire request if webhook fails
+                # Use a separate session for webhook to avoid session conflicts
+                from src.backend.database import AsyncSessionLocal
+                async with AsyncSessionLocal() as webhook_db:
+                    try:
+                        webhook_service = WebhookService(webhook_db)
+                        
+                        # Prepare result data with timestamp
+                        result_data = {
+                            **aggregated_data,
+                            "timestamp": datetime.utcnow(),
+                        }
+                        
+                        await webhook_service.send_webhook(request_id, result_data)
+                    except Exception as e:
+                        logger.error(
+                            f"Webhook delivery failed for request {request_id}: {str(e)}",
+                            extra={"request_id": request_id},
+                        )
+                        # Don't fail the entire request if webhook fails
 
         except OrchestrationError as e:
             logger.error(

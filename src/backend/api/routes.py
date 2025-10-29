@@ -5,6 +5,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -116,12 +117,12 @@ async def process_text(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
-@router.get("/results/{request_id}", response_model=AggregatedResultResponse)
+@router.get("/results/{request_id}")
 async def get_result(
     request_id: UUID,
     db: DatabaseDep,
     request_id_header: RequestIdDep,
-) -> AggregatedResultResponse:
+):
     """
     Get processing result for a specific request.
 
@@ -136,24 +137,73 @@ async def get_result(
     Raises:
         HTTPException: If request not found
     """
+    # Trace: incoming request
+    logger.info(
+        f"Results lookup requested",
+        extra={
+            "request_id": request_id_header,
+            "lookup_request_id": str(request_id),
+        },
+    )
+
+    # Lookup aggregated result
     result = await db.scalar(
         select(AggregatedResult).where(AggregatedResult.request_id == request_id)
+    )
+
+    logger.info(
+        "Results lookup stage: aggregated_result",
+        extra={
+            "request_id": request_id_header,
+            "lookup_request_id": str(request_id),
+            "found": bool(result),
+        },
     )
 
     if not result:
         # Check if request exists
         request = await db.get(ProcessingRequest, request_id)
         if not request:
+            logger.warning(
+                "Results lookup stage: processing_request missing",
+                extra={
+                    "request_id": request_id_header,
+                    "lookup_request_id": str(request_id),
+                },
+            )
             raise HTTPException(status_code=404, detail="Processing request not found")
 
-        # Request exists but no result yet
-        raise HTTPException(
-            status_code=404,
-            detail="Processing result not yet available",
+        # Request exists but no result yet - log and return 202 Accepted for polling
+        logger.info(
+            "Results lookup stage: no aggregated_result yet",
+            extra={
+                "request_id": request_id_header,
+                "lookup_request_id": str(request_id),
+                "processing_status": request.status.value,
+            },
+        )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "request_id": str(request_id),
+                "status": request.status.value,
+                "detail": "Processing result not yet available",
+            },
         )
 
     # Get processing request for webhook status
     request = await db.get(ProcessingRequest, request_id)
+
+    logger.info(
+        "Results lookup stage: returning response",
+        extra={
+            "request_id": request_id_header,
+            "lookup_request_id": str(request_id),
+            "processing_status": request.status.value if request else None,
+            "created_at": str(result.created_at),
+            "total_execution_time": result.total_execution_time,
+        },
+    )
 
     # Get agent results
     agent_results_query = await db.execute(
@@ -285,6 +335,58 @@ async def list_results(
         has_previous=page > 1,
     )
 
+
+@router.get("/requests/{request_id}/status")
+async def get_request_status(
+    request_id: UUID,
+    db: DatabaseDep,
+    request_id_header: RequestIdDep,
+) -> dict:
+    """
+    Lightweight status endpoint for clients to poll processing status.
+
+    Returns:
+        JSON with request_id, status, webhook_status, webhook_attempts, webhook_last_attempt, created_at.
+    """
+    logger.info(
+        "Status lookup requested",
+        extra={
+            "request_id": request_id_header,
+            "lookup_request_id": str(request_id),
+        },
+    )
+
+    request = await db.get(ProcessingRequest, request_id)
+    if not request:
+        logger.warning(
+            "Status lookup: processing_request not found",
+            extra={
+                "request_id": request_id_header,
+                "lookup_request_id": str(request_id),
+            },
+        )
+        raise HTTPException(status_code=404, detail="Processing request not found")
+
+    payload = {
+        "request_id": str(request_id),
+        "status": request.status.value,
+        "webhook_status": request.webhook_status.value if request.webhook_status else None,
+        "webhook_attempts": request.webhook_attempts,
+        "webhook_last_attempt": request.webhook_last_attempt,
+        "created_at": request.created_at,
+    }
+
+    logger.info(
+        "Status lookup response",
+        extra={
+            "request_id": request_id_header,
+            "lookup_request_id": str(request_id),
+            "status": payload["status"],
+            "webhook_status": payload["webhook_status"],
+        },
+    )
+
+    return payload
 
 @router.get("/webhook-logs/{request_id}", response_model=list[WebhookLogResponse])
 async def get_webhook_logs(

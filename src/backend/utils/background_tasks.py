@@ -35,9 +35,17 @@ async def process_text_async(request_id: UUID) -> None:
         try:
             service = ProcessingService(db)
             await service.process_request_background(request_id)
-            await db.commit()
+            # Note: process_request_background handles its own commits internally
+            # No need to commit again here as it already commits on success/failure
         except Exception as e:
-            await db.rollback()
+            # Only rollback if there was an uncommitted transaction
+            # process_request_background commits even on errors, so this is mainly
+            # for cases where the service wasn't fully initialized
+            try:
+                await db.rollback()
+            except Exception:
+                # Ignore rollback errors if transaction was already committed
+                pass
             logger.error(
                 f"Background processing failed for request {request_id}: {str(e)}",
                 exc_info=True,
